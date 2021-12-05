@@ -1,0 +1,443 @@
+First we create security groups for the database (RDS_SG) and for the nodes and the pods (NODE_SG and POD_DG). Then lets allow communication the two last with each other
+
+
+export VPC_ID=$(aws eks describe-cluster \
+    --name Cluster-1 \
+    --query "cluster.resourcesVpcConfig.vpcId" \
+    --output text)
+
+# create RDS security group
+aws ec2 create-security-group \
+    --description 'RDS SG' \
+    --group-name 'RDS_SG' \
+    --vpc-id ${VPC_ID}
+
+# save the security group ID for future use
+export RDS_SG=$(aws ec2 describe-security-groups \
+    --filters Name=group-name,Values=RDS_SG Name=vpc-id,Values=${VPC_ID} \
+    --query "SecurityGroups[0].GroupId" --output text)
+
+
+# create the Pod security group
+aws ec2 create-security-group \
+    --description 'POD SG' \
+    --group-name 'POD_SG' \
+    --vpc-id ${VPC_ID}
+
+# save the security group ID for future use
+export POD_SG=$(aws ec2 describe-security-groups \
+    --filters Name=group-name,Values=POD_SG Name=vpc-id,Values=${VPC_ID} \
+    --query "SecurityGroups[0].GroupId" --output text)
+
+echo "Pod security group ID: ${POD_SG}"
+
+
+export NODE_GROUP_SG=$(aws ec2 describe-security-groups \
+    --filters Name=tag:Name,Values=eks-cluster-sg-Cluster-1-* Name=vpc-id,Values=${VPC_ID} \
+    --query "SecurityGroups[0].GroupId" \
+    --output text)
+echo "Node Group security group ID: ${NODE_GROUP_SG}"
+
+# allow POD_SG to connect to NODE_GROUP_SG using TCP 53
+aws ec2 authorize-security-group-ingress \
+    --group-id ${NODE_GROUP_SG} \
+    --protocol tcp \
+    --port 53 \
+    --source-group ${POD_SG}
+
+# allow POD_SG to connect to NODE_GROUP_SG using UDP 53
+aws ec2 authorize-security-group-ingress \
+    --group-id ${NODE_GROUP_SG} \
+    --protocol udp \
+    --port 53 \
+    --source-group ${POD_SG}
+
+
+# Instance IP
+export INSTANCE_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+# allow instance to connect to RDS
+aws ec2 authorize-security-group-ingress \
+    --group-id ${RDS_SG} \
+    --protocol tcp \
+    --port 5432 \
+    --cidr ${INSTANCE_IP}/32
+
+# Allow POD_SG to connect to the RDS
+aws ec2 authorize-security-group-ingress \
+    --group-id ${RDS_SG} \
+    --protocol tcp \
+    --port 5432 \
+    --source-group ${POD_SG}
+
+
+
+
+
+
+2. Create the database
+export PUBLIC_SUBNETS_ID=$(aws ec2 describe-subnets \
+    --filters "Name=vpc-id,Values=$VPC_ID" "Name=tag:Name,Values=eksctl-Cluster-1-cluster/SubnetPublic*" \
+    --query 'Subnets[*].SubnetId' \
+    --output json | tr -d '\n ')
+
+# create a db subnet group
+aws rds create-db-subnet-group \
+    --db-subnet-group-name rds-ekslab \
+    --db-subnet-group-description rds-ekslab \
+    --subnet-ids ${PUBLIC_SUBNETS_ID}
+
+# get RDS SG ID
+export RDS_SG=$(aws ec2 describe-security-groups \
+    --filters Name=group-name,Values=RDS_SG Name=vpc-id,Values=${VPC_ID} \
+    --query "SecurityGroups[0].GroupId" --output text)
+
+# generate a password for RDS
+export RDS_PASSWORD="$(date | md5sum  |cut -f1 -d' ')"
+echo ${RDS_PASSWORD}  > .rds_password
+
+# create RDS Postgresql instance
+aws rds create-db-instance \
+    --db-instance-identifier rds-ekslab \
+    --db-name ekslab \
+    --db-instance-class db.t3.micro \
+    --engine postgres \
+    --db-subnet-group-name rds-ekslab \
+    --vpc-security-group-ids $RDS_SG \
+    --master-username ekslab \
+    --publicly-accessible \
+    --master-user-password ${RDS_PASSWORD} \
+    --backup-retention-period 0 \
+    --allocated-storage 20
+
+
+
+Verifiy the database is running (check the status)
+watch aws rds describe-db-instances \
+    --db-instance-identifier rds-ekslab \
+    --query "DBInstances[].DBInstanceStatus" \
+    --output text
+
+
+# get RDS endpoint
+export RDS_ENDPOINT=$(aws rds describe-db-instances \
+    --db-instance-identifier rds-ekslab \
+    --query 'DBInstances[0].Endpoint.Address' \
+    --output text)
+
+echo "RDS endpoint: ${RDS_ENDPOINT}"
+
+
+
+
+#create some content
+sudo amazon-linux-extras install -y postgresql12
+
+cat << EOF > sg-per-pod-pgsql.sql
+CREATE TABLE welcome (column1 TEXT);
+insert into welcome values ('--------------------------');
+insert into welcome values ('  Welcome to the eks lab  ');
+insert into welcome values ('--------------------------');
+EOF
+
+export RDS_PASSWORD=$(cat .rds_password)
+
+psql postgresql://ekslab:${RDS_PASSWORD}@${RDS_ENDPOINT}:5432/ekslab \
+    -f sg-per-pod-pgsql.sql
+
+
+
+3. Edit CNI
+Introduction
+
+To enable this new functionality, Amazon EKS clusters have two new components running on the Kubernetes control plane:
+
+    A mutating webhook responsible for adding limits and requests to pods requiring security groups.
+    A resource controller responsible for managing network interfaces associated with those pods.
+
+To facilitate this feature, each worker node will be associated with a single trunk network interface and multiple branch network interfaces. The trunk interface acts as a standard network interface attached to the instance. The VPC resource controller then associates branch interfaces to the trunk interface. This increases the number of network interfaces that can be attached per instance. Since security groups are specified with network interfaces, you are now able to schedule pods requiring specific security groups onto these additional network interfaces allocated to worker nodes.
+
+This also requires a new IAM policy is attached to the Node group role to allow the EC2 instances to manage network interfaces, their private IP addresses, and their attachment and detachment to and from instances. The AWS-managed policy AmazonEKSVPCResourceController has already been attached to the node group's role for you in this lab.
+
+
+kubectl -n kube-system set env daemonset aws-node ENABLE_POD_ENI=true
+
+# Wait for the rolling update of the daemonset
+kubectl -n kube-system rollout status ds aws-node
+
+
+kubectl get nodes --show-labels \
+| grep has-trunk-attached
+
+
+
+
+
+A new Custom Resource Definition (CRD) has also been added automatically at the cluster creation. Cluster administrators can specify which security groups to assign to pods through the SecurityGroupPolicy CRD. Within a namespace, you can select pods based on pod labels, or based on labels of the service account associated with a pod. For any matching pods, you also define the security group IDs to be applied.
+
+
+kubectl create namespace networking
+kubectl config set-context $(kubectl config current-context) --namespace=networking
+kubectl get crd securitygrouppolicies.vpcresources.k8s.aws
+
+
+
+
+cat << EOF > sg-per-pod-policy.yaml
+apiVersion: vpcresources.k8s.aws/v1beta1
+kind: SecurityGroupPolicy
+metadata:
+  name: allow-rds-access
+spec:
+  podSelector:
+    matchLabels:
+      app: green-pod
+  securityGroups:
+    groupIds:
+      - ${POD_SG}
+EOF
+
+
+
+
+kubectl apply -f sg-per-pod-policy.yaml
+kubectl describe securitygrouppolicy
+
+
+
+
+
+TEST
+
+export RDS_PASSWORD=$(cat .rds_password)
+
+export RDS_ENDPOINT=$(aws rds describe-db-instances \
+    --db-instance-identifier rds-ekslab \
+    --query 'DBInstances[0].Endpoint.Address' \
+    --output text)
+
+kubectl create secret generic rds \
+    --from-literal="password=${RDS_PASSWORD}" \
+    --from-literal="host=${RDS_ENDPOINT}"
+
+kubectl describe secret rds
+
+
+
+
+cat << EOF > green-pod.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: green-pod
+  name: green-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: green-pod
+  template:
+    metadata:
+      labels:
+        app: green-pod
+    spec:
+      affinity:
+       nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: "vpc.amazonaws.com/has-trunk-attached"
+              operator: In
+              values:
+                - "true"
+      containers:
+      - image: public.ecr.aws/cloudacademy-labs/cloudacademy/labs/eks-lab-app:8444b90
+        name: green-pod
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "500m"
+          limits:
+            memory: "512Mi"
+            cpu: "1024m"
+        env:
+        - name: HOST
+          valueFrom:
+            secretKeyRef:
+              name: rds
+              key: host
+        - name: DBNAME
+          value: ekslab
+        - name: USER
+          value: ekslab
+        - name: PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rds
+              key: password
+EOF
+
+
+
+
+cat << EOF > red-pod.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: red-pod
+  name: red-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: red-pod
+  template:
+    metadata:
+      labels:
+        app: red-pod
+    spec:
+      affinity:
+       nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: "vpc.amazonaws.com/has-trunk-attached"
+              operator: In
+              values:
+                - "true"
+      containers:
+      - image: public.ecr.aws/cloudacademy-labs/cloudacademy/labs/eks-lab-app:8444b90
+        name: red-pod
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "500m"
+          limits:
+            memory: "512Mi"
+            cpu: "1024m"
+        env:
+        - name: HOST
+          valueFrom:
+            secretKeyRef:
+              name: rds
+              key: host
+        - name: DBNAME
+          value: ekslab
+        - name: USER
+          value: ekslab
+        - name: PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rds
+              key: password
+EOF
+
+
+
+
+kubectl apply -f green-pod.yaml
+
+kubectl rollout status deployment green-pod
+
+
+
+
+#Verify the green pod could connect to the database using the logs:
+
+export GREEN_POD_NAME=$(kubectl get pods -l app=green-pod -o jsonpath='{.items[].metadata.name}')
+kubectl logs -f ${GREEN_POD_NAME}
+
+
+
+Now you will verify that:
+    An ENI is attached to the pod.
+    And the ENI has the security group POD_SG attached to it.
+kubectl describe pod $GREEN_POD_NAME | head -11
+https://console.aws.amazon.com/ec2/home#NIC:search=POD_SG
+
+
+
+If you follow the same process for the red-pod.yaml you will see that there are no enis attached
+kubectl apply -f red-pod.yaml
+kubectl rollout status deployment red-pod
+
+export RED_POD_NAME=$(kubectl get pods -l app=red-pod -o jsonpath='{.items[].metadata.name}')
+kubectl logs -f ${RED_POD_NAME}
+kubectl describe pod ${RED_POD_NAME} | head -11
+
+
+
+
+
+
+
+clean up
+
+# delete database
+aws rds delete-db-instance \
+    --db-instance-identifier rds-ekslab \
+    --delete-automated-backups \
+    --skip-final-snapshot > /dev/null
+
+# delete kubernetes element
+kubectl delete -f green-pod.yaml
+kubectl delete -f red-pod.yaml
+kubectl delete -f sg-per-pod-policy.yaml
+kubectl delete secret rds
+
+# disable ENI trunking
+kubectl -n kube-system set env daemonset aws-node ENABLE_POD_ENI=false
+kubectl -n kube-system rollout status ds aws-node
+
+# remove the security groups rules
+aws ec2 revoke-security-group-ingress \
+    --group-id ${RDS_SG} \
+    --protocol tcp \
+    --port 5432 \
+    --source-group ${POD_SG}
+
+aws ec2 revoke-security-group-ingress \
+    --group-id ${RDS_SG} \
+    --protocol tcp \
+    --port 5432 \
+    --cidr ${INSTANCE_IP}/32
+
+aws ec2 revoke-security-group-ingress \
+    --group-id ${NODE_GROUP_SG} \
+    --protocol tcp \
+    --port 53 \
+    --source-group ${POD_SG}
+
+aws ec2 revoke-security-group-ingress \
+    --group-id ${NODE_GROUP_SG} \
+    --protocol udp \
+    --port 53 \
+    --source-group ${POD_SG}
+
+# delete Pod security group
+aws ec2 delete-security-group \
+    --group-id ${POD_SG}
+
+
+
+
+Verify clean up
+
+aws rds describe-db-instances \
+    --db-instance-identifier rds-ekslab \
+    --query "DBInstances[].DBInstanceStatus" \
+    --output text
+
+
+
+Delete SGs
+
+# delete RDS SG
+aws ec2 delete-security-group \
+    --group-id ${RDS_SG}
+
+# delete DB subnet group
+aws rds delete-db-subnet-group \
+    --db-subnet-group-name rds-ekslab

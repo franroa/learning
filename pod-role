@@ -1,0 +1,166 @@
+eksctl utils associate-iam-oidc-provider --cluster=<clusterName>
+
+
+
+aws iam get-role --role-name s3-poller-role
+
+{
+    "Role": {
+        "Path": "/",
+        "RoleName": "s3-poller-role",
+        "RoleId": "AROA564EHELX6PD5M43ND",
+        "Arn": "arn:aws:iam::959665611503:role/s3-poller-role",
+        "CreateDate": "2021-11-24T18:41:44+00:00",
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Federated": "arn:aws:iam::959665611503:oidc-provider/oidc.eks.us-west-2.amazonaws.com/id/D446FD1932C73DEFABDC01C68523EF30"
+                    },
+                    "Action": "sts:AssumeRoleWithWebIdentity",
+                    "Condition": {
+                        "StringEquals": {
+                            "oidc.eks.us-west-2.amazonaws.com/id/D446FD1932C73DEFABDC01C68523EF30:aud": "sts.amazonaws.com",
+                            "oidc.eks.us-west-2.amazonaws.com/id/D446FD1932C73DEFABDC01C68523EF30:sub": "system:serviceaccount:iam-oidc:s3-poller"
+                        }
+                    }
+                }
+            ]
+        },
+        "Description": "",
+        "MaxSessionDuration": 3600,
+        "RoleLastUsed": {}
+    }
+}
+
+
+
+aws iam get-role-policy --role-name s3-poller-role --policy-name s3-poller-policy
+{
+    "RoleName": "s3-poller-role",
+    "PolicyName": "s3-poller-policy",
+    "PolicyDocument": {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Action": "s3:List*",
+                "Resource": "arn:aws:s3:::cloudacademylabs-labbucket-ylcdpt0b7iy",
+                "Effect": "Allow"
+            },
+            {
+                "Action": "s3:PutObject",
+                "Resource": "arn:aws:s3:::cloudacademylabs-labbucket-ylcdpt0b7iy/*",
+                "Effect": "Allow"
+            }
+        ]
+    }
+}
+
+
+
+aws eks describe-cluster --name Cluster-1 --region us-west-2 --query cluster.identity
+{
+    "oidc": {
+        "issuer": "https://oidc.eks.us-west-2.amazonaws.com/id/D446FD1932C73DEFABDC01C68523EF30"
+    }
+}
+
+
+
+
+
+
+BUCKET_NAME=$(aws s3api list-buckets --query "Buckets[0].Name" --output text)
+
+
+cat > ./deployment-s3.yaml <<- 'EOF'
+apiVersion: apps/v1
+
+kind: Deployment
+
+metadata:
+
+  name: s3-poller
+
+spec:
+
+  selector:
+
+    matchLabels:
+
+      app: s3-poller
+
+  replicas: 1
+
+  template:
+
+    metadata:
+
+      labels:
+
+        app: s3-poller
+
+    spec:
+
+      containers:
+
+      - name: s3-poller
+
+        image: public.ecr.aws/cloudacademy-labs/cloudacademy/labs/aws-cli:2a74f3c
+
+        command: ["/bin/sh", "-c"]
+
+        env:
+
+        - name: BUCKET_NAME
+
+          value: lab-bucket-name
+
+        args:
+
+        - |
+
+          echo --- starting ---;
+
+          echo --- using bucket $BUCKET_NAME ---;
+
+          while true; do
+
+              sleep 10
+
+              echo --- slept ten seconds ---
+
+
+
+              aws s3 ls s3://$BUCKET_NAME/ --recursive | wc -l > object_count.txt
+
+              echo --- fetched object count $(cat object_count.txt) ---
+
+
+
+              aws s3api put-object --bucket $BUCKET_NAME --key count/object_count.txt --body ./object_count.txt
+
+              echo --- object count put in $BUCKET_NAME/count/object_count.txt ---
+
+          done;
+
+EOF
+
+
+sed -i "s/lab-bucket-name/$BUCKET_NAME/g" ./deployment-s3.yaml
+
+
+kubectl apply -f ./deployment-s3.yaml
+
+
+kubectl create serviceaccount s3-poller
+
+kubectl annotate serviceaccount s3-poller \
+    'eks.amazonaws.com/role-arn'='arn:aws:iam::959665611503:role/s3-poller-role'
+
+kubectl describe serviceaccount s3-poller
+
+kubectl patch deployment s3-poller \
+  -p '{"spec":{"template":{"spec":{"serviceAccountName":"s3-poller"}}}}'
