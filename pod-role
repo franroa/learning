@@ -2,6 +2,7 @@
 1. Configure the OIDC provider for the service account in a given namespace
 2. annotate the service account with the role name ("eks.amazonaws.com/role-arn")
 
+Don't forget to remove the pod after annotating the serviceaccount
 
 eksctl utils associate-iam-oidc-provider --cluster=<clusterName>
 
